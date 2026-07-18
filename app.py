@@ -21,6 +21,9 @@ SAFEMAP_URL = "https://safemap.go.kr/openapi2/IF_0043"
 STAIR_KW = ["계단", "육교", "지하보도", "에스컬레이터"]
 NARROW_KW = ["보행자도로", "이면도로", "골목"]
 NARROW_RT = {0, 22}
+CROSS_FT = {"15"}                 # facilityType 15 = 횡단보도
+STAIR_FT = {"12", "14", "17"}     # 12 육교, 14 지하보도, 17 계단
+CROSS_TT = {211, 212, 213}        # turnType: 횡단보도/좌측/우측 횡단보도
 _M = 111320.0
 
 st.set_page_config(page_title="보행자 경로", page_icon="🚶", layout="wide")
@@ -80,21 +83,30 @@ def merc2wgs(x, y):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_construction(max_pages=60, rows=1000):
-    """생활안전지도 건설공사현황 전체 수집 (하루 캐시)"""
+    """생활안전지도 건설공사현황 전체 수집.
+    최초 1회만 실제 다운로드(진행바 표시), 이후 24시간 서버 캐시로 즉시 반환."""
     items = []
-    for p in range(1, max_pages + 1):
-        r = requests.get(SAFEMAP_URL,
-                         params={"serviceKey": SAFEMAP_KEY, "pageNo": p,
-                                 "numOfRows": rows, "returnType": "json"},
-                         timeout=20)
-        r.raise_for_status()
-        body = r.json().get("body", {})
-        batch = body.get("items", {}).get("item", []) or []
-        if isinstance(batch, dict):
-            batch = [batch]
-        items += batch
-        if not batch or p * rows >= int(body.get("totalCount", 0)):
-            break
+    bar = st.progress(0.0, text="🚧 건설공사 데이터 로딩 중... (최초 1회)")
+    try:
+        for p in range(1, max_pages + 1):
+            r = requests.get(SAFEMAP_URL,
+                             params={"serviceKey": SAFEMAP_KEY, "pageNo": p,
+                                     "numOfRows": rows, "returnType": "json"},
+                             timeout=20)
+            r.raise_for_status()
+            body = r.json().get("body", {})
+            total_cnt = int(body.get("totalCount", 0)) or 1
+            batch = body.get("items", {}).get("item", []) or []
+            if isinstance(batch, dict):
+                batch = [batch]
+            items += batch
+            bar.progress(min(len(items) / total_cnt, 1.0),
+                         text=f"🚧 건설공사 데이터 로딩 중... "
+                              f"{len(items):,}/{total_cnt:,}건")
+            if not batch or p * rows >= total_cnt:
+                break
+    finally:
+        bar.empty()
     return items
 
 
@@ -144,7 +156,9 @@ def parse_route(gj):
             lon, lat = g["coordinates"]
             pts.append({"lat": lat, "lon": lon, "idx": p.get("pointIndex", 0),
                         "type": p.get("pointType", ""),
-                        "desc": clean(p.get("description"))})
+                        "desc": clean(p.get("description")),
+                        "turnType": p.get("turnType", 0),
+                        "ft": str(p.get("facilityType", ""))})
             if p.get("pointType") == "SP":
                 total = {"distance": p.get("totalDistance", 0),
                          "time": p.get("totalTime", 0)}
@@ -156,6 +170,7 @@ def parse_route(gj):
                           "distance": p.get("distance", 0),
                           "roadType": p.get("roadType", -1),
                           "desc": clean(p.get("description")),
+                          "ft": str(p.get("facilityType", "")),
                           "coords": g["coordinates"]})
     return pts, coords, lines, total
 
@@ -187,7 +202,19 @@ def dotted_points(coords, spacing_m=12.0):
     return pd.DataFrame(pts, columns=["lat", "lon"])
 
 
+def is_crosswalk(l):
+    """횡단보도 구간 (좁은 길에서 제외하고 별도 표시)"""
+    return l.get("ft") in CROSS_FT
+
+
+def is_stair_line(l):
+    """계단/육교/지하보도 구간 (좁은 길이 아니라 '계단' 위반으로 계상)"""
+    return l.get("ft") in STAIR_FT
+
+
 def is_narrow(l):
+    if is_crosswalk(l) or is_stair_line(l):
+        return False
     return l["roadType"] in NARROW_RT or any(k in l["name"] for k in NARROW_KW)
 
 
@@ -197,6 +224,10 @@ def violations(pts, lines, zones, a_st, a_nr, a_zn, coords):
         for p in pts:
             if any(k in p["desc"] for k in STAIR_KW):
                 v["계단"].append(p["desc"])
+        for l in lines:
+            if is_stair_line(l):
+                ftn = {"12": "육교", "14": "지하보도", "17": "계단"}.get(l["ft"], "계단시설")
+                v["계단"].append(f"{ftn} 구간 {l['distance']}m")
     if a_nr:
         for l in lines:
             if is_narrow(l):
@@ -222,15 +253,35 @@ def score_of(v, total, hits):
     return len(v["계단"]) * 1000 + len(hits) * 5000 + nar * 2 + total["distance"]
 
 
-def detour_point(hits, zones):
+def detour_point(hits, zones, factor=1.8):
+    """위반 지점을 구역 중심 반대 방향으로 radius*factor 미터 밀어낸 우회점.
+    경도는 위도에 따라 미터 환산이 달라지므로 cos(lat) 보정."""
     if not hits or not zones:
         return None
     lon, lat = hits[len(hits) // 2]
     z = min(zones, key=lambda z: hav_m((lon, lat), (z["lon"], z["lat"])))
-    dx, dy = lon - z["lon"], lat - z["lat"]
-    n = math.hypot(dx, dy) or 1e-9
-    push = (z["radius"] * 1.8) / _M
-    return (z["lon"] + dx / n * push, z["lat"] + dy / n * push)
+    coslat = math.cos(math.radians(z["lat"]))
+    dx_m = (lon - z["lon"]) * _M * coslat          # 미터 단위 방향 벡터
+    dy_m = (lat - z["lat"]) * _M
+    n = math.hypot(dx_m, dy_m) or 1e-9
+    dist = z["radius"] * factor                    # 목표 밀어내기 거리(m)
+    return (z["lon"] + (dx_m / n * dist) / (_M * coslat),
+            z["lat"] + (dy_m / n * dist) / _M)
+
+
+def insert_detour(waypts, dp, start, end):
+    """출발-경유-도착 앵커 중 dp와 가장 가까운 구간 사이에 삽입"""
+    anchors = [start] + list(waypts) + [end]
+    bi, bd = 0, float("inf")
+    for i in range(len(anchors) - 1):
+        mid = ((anchors[i][0] + anchors[i + 1][0]) / 2,
+               (anchors[i][1] + anchors[i + 1][1]) / 2)
+        d = hav_m(dp, mid)
+        if d < bd:
+            bi, bd = i, d
+    out = list(waypts)
+    out.insert(bi, dp)
+    return out
 
 
 def find_route(start, end, waypts, zones, a_st, a_nr, a_zn):
@@ -252,25 +303,38 @@ def find_route(start, end, waypts, zones, a_st, a_nr, a_zn):
         cands.append(cand)
         if best is None or sc < best["score"]:
             best = cand
-    if best and best["hits"] and len(waypts) < 5:
-        dp = detour_point(best["hits"], zones)
-        if dp:
-            try:
-                gj = call_tmap(start, end, best["opt"], pass_list=waypts + [dp])
-                pts, coords, lines, total = parse_route(gj)
-                v, hits = violations(pts, lines, zones, a_st, a_nr, a_zn, coords)
-                sc = score_of(v, total, hits)
-                cands.append({"opt": f"{best['opt']}+우회", "pts": pts,
-                              "coords": coords, "lines": lines, "total": total,
-                              "viol": v, "hits": hits, "score": sc})
-                if sc < best["score"]:
-                    best = {"opt": f"{best['opt']}+우회", "pts": pts,
-                            "coords": coords, "lines": lines, "total": total,
-                            "viol": v, "hits": hits, "score": sc}
-                    detour = dp
-            except Exception as e:
-                errs.append(f"우회 재탐색: {e}")
-    return best, cands, errs, detour
+    # 공사 구역을 지나면: 우회 경유지를 반복 삽입해 돌아서라도 회피
+    #   반복마다 밀어내는 거리를 키움 (반경의 1.8배 → 2.6배 → 3.4배)
+    detours = []
+    base_opt = best["opt"] if best else None
+    wp_cur = list(waypts)
+    it = 0
+    while (best and best["hits"] and len(wp_cur) < 5 and it < 3):
+        it += 1
+        dp = detour_point(best["hits"], zones, factor=1.0 + 0.8 * it)
+        if not dp:
+            break
+        wp_cur = insert_detour(wp_cur, dp, start, end)
+        try:
+            gj = call_tmap(start, end, base_opt, pass_list=wp_cur)
+        except Exception as e:
+            errs.append(f"우회 {it}차 재탐색: {e}")
+            break
+        pts, coords, lines, total = parse_route(gj)
+        v, hits = violations(pts, lines, zones, a_st, a_nr, a_zn, coords)
+        sc = score_of(v, total, hits)
+        cands.append({"opt": f"{base_opt}+우회{it}", "pts": pts,
+                      "coords": coords, "lines": lines, "total": total,
+                      "viol": v, "hits": hits, "score": sc})
+        # 공사 통과가 줄었으면 채택 (거리가 늘어도 회피가 우선: 페널티 5000/지점)
+        if len(hits) < len(best["hits"]) or sc < best["score"]:
+            best = {"opt": f"{base_opt}+우회{it}", "pts": pts, "coords": coords,
+                    "lines": lines, "total": total, "viol": v,
+                    "hits": hits, "score": sc}
+            detours.append(dp)
+        else:
+            wp_cur = [w for w in wp_cur if w != dp]   # 효과 없으면 되돌림
+    return best, cands, errs, detours
 
 
 # ─────────────────────────────────────────────
@@ -281,19 +345,9 @@ ss.setdefault("route", None)
 ss.setdefault("labels", {})
 ss.setdefault("zones", [])
 ss.setdefault("cands", [])
-ss.setdefault("detour", None)
+ss.setdefault("detours", [])
 ss.setdefault("opts_used", (False, False, False))
 
-# ── 공사 데이터 선로딩: 앱이 뜨는 즉시 백그라운드 캐시로 확보 ──
-if "constr_items" not in ss:
-    with st.spinner("🚧 생활안전지도 건설공사 데이터를 미리 로딩 중... "
-                    "(최초 1회, 이후 24시간 캐시)"):
-        try:
-            ss["constr_items"] = fetch_construction()
-            ss["constr_err"] = None
-        except Exception as e:
-            ss["constr_items"] = []
-            ss["constr_err"] = str(e)
 
 with st.sidebar:
     st.header("📍 지점 입력")
@@ -324,19 +378,11 @@ with st.sidebar:
     a_nr = st.checkbox("↔️ 좁은 길 피하기 (대로 우선)", value=False)
     a_zn = st.checkbox("🚧 공사 구역 피하기 (생활안전지도)", value=False)
     radius = st.slider("공사장 회피 반경(m)", 30, 300, 100)
-    if ss.get("constr_err"):
-        st.error(f"공사 데이터 로드 실패: {ss['constr_err']}")
-        if st.button("공사 데이터 다시 시도"):
-            fetch_construction.clear()
-            del ss["constr_items"]
-            st.rerun()
-    else:
-        st.caption(f"✅ 공사 데이터 준비됨: 전국 "
-                   f"{len(ss.get('constr_items', [])):,}건 (24h 캐시)")
-        if st.button("공사 데이터 새로고침"):
-            fetch_construction.clear()
-            del ss["constr_items"]
-            st.rerun()
+    st.caption("공사 데이터는 탐색 시 자동 로드됩니다 "
+               "(최초 1회만 다운로드, 24시간 캐시)")
+    if st.button("공사 데이터 캐시 비우기"):
+        fetch_construction.clear()
+        st.toast("캐시를 비웠습니다. 다음 탐색 때 새로 받습니다.")
 
     st.header("🎨 표시")
     spacing = st.slider("점선 간격(m)", 5, 30, 12)
@@ -391,20 +437,19 @@ if go:
         for e in errors:
             st.error(e)
     else:
-        # 4) 공사 구역 (선로딩된 데이터에서 앵커 주변 1km만 필터, 즉시 완료)
+        # 4) 공사 구역: 그때그때 로드 (캐시되어 두 번째부터는 즉시)
         zones = []
         if a_zn:
-            if ss.get("constr_err"):
-                st.warning("공사 데이터가 로드되지 않아 공사 회피 없이 진행합니다. "
-                           "사이드바에서 '다시 시도'를 눌러주세요.")
-            else:
-                zones = zones_near(ss["constr_items"],
-                                   [start] + waypts + [end], radius)
+            try:
+                items = fetch_construction()
+                zones = zones_near(items, [start] + waypts + [end], radius)
+            except Exception as e:
+                st.warning(f"공사 데이터 로딩 실패(공사 회피 없이 진행): {e}")
 
         # 5) 경로 탐색
         with st.spinner("경로 탐색 중..."):
-            best, cands, errs, detour = find_route(start, end, waypts, zones,
-                                                   a_st, a_nr, a_zn)
+            best, cands, errs, detours = find_route(start, end, waypts, zones,
+                                                     a_st, a_nr, a_zn)
         for e in errs:
             st.warning(e)
         if best:
@@ -412,7 +457,7 @@ if go:
             ss["labels"] = labels
             ss["zones"] = zones
             ss["cands"] = cands
-            ss["detour"] = detour
+            ss["detours"] = detours
             ss["opts_used"] = (a_st, a_nr, a_zn)
             st.rerun()
         else:
@@ -452,6 +497,13 @@ for l in narrow_lines:
     if len(seg):
         layers.append(seg.assign(color="#8e44ad", size=4))
 
+# 횡단보도 구간: 초록색 점으로 표시 (좁은 길과 별개)
+cross_lines = [l for l in lines if is_crosswalk(l)]
+for l in cross_lines:
+    seg = dotted_points(l.get("coords", []), max(spacing * 0.4, 3))
+    if len(seg):
+        layers.append(seg.assign(color="#27ae60", size=5))
+
 # 계단 안내 지점: 빨간 경고 점
 stair_pts = [p for p in pts if any(k in p["desc"] for k in STAIR_KW)]
 if stair_pts:
@@ -481,17 +533,19 @@ if zones:
                 "color": "#e67e22", "size": 2.5})
     layers.append(pd.DataFrame(ring))
 
-# 자동 삽입된 우회 경유지 (청록 큰 점)
-if ss["detour"]:
-    layers.append(pd.DataFrame([{"lat": ss["detour"][1], "lon": ss["detour"][0],
-                                 "color": "#16a085", "size": 12}]))
+# 자동 삽입된 우회 경유지들 (청록 큰 점)
+if ss["detours"]:
+    layers.append(pd.DataFrame([{"lat": d[1], "lon": d[0],
+                                 "color": "#16a085", "size": 12}
+                                for d in ss["detours"]]))
 
 st.map(pd.concat(layers, ignore_index=True), latitude="lat", longitude="lon",
        color="color", size="size", zoom=15)
 
-st.caption("🔵 경로  🟣 좁은 길 구간  🔴 계단 지점  🟠 공사 구역(원=회피 반경)  "
-           "🟢 출발  🟠 경유  🔴 도착  " +
-           ("🟦(청록) 자동 우회 경유지" if ss["detour"] else ""))
+st.caption("🔵 경로  🟢(진초록) 횡단보도  🟣 좁은 길  🔴 계단/육교/지하보도  "
+           "🟠 공사 구역(원=회피 반경)  🟢 출발  🟠 경유  🔴 도착" +
+           (f"  🟦(청록) 자동 우회 경유지 {len(ss['detours'])}곳"
+            if ss["detours"] else ""))
 
 # ── 회피 과정 설명 ──
 a_st_u, a_nr_u, a_zn_u = ss["opts_used"]
@@ -524,9 +578,21 @@ if a_st_u or a_nr_u or a_zn_u:
                 "공사통과(지점)": len(c["hits"]),
                 "페널티": c["score"],
             } for c in ss["cands"]]), use_container_width=True, hide_index=True)
-        if ss["detour"]:
-            st.info("🟦 공사 구역 통과가 감지되어 우회 경유지를 자동 삽입해 "
-                    "재탐색한 경로입니다.")
+        if ss["detours"]:
+            st.info(f"🟦 공사 구역 통과가 감지되어 우회 경유지 "
+                    f"{len(ss['detours'])}곳을 자동 삽입(최대 3회 반복, "
+                    f"반복마다 더 멀리 밀어냄)해 돌아가는 경로를 택했습니다.")
+        if r["hits"]:
+            st.error("⛔ 우회를 반복해도 공사 구역을 완전히 피하는 보행 경로를 "
+                     "찾지 못했습니다. 해당 구간은 통행 불가일 수 있으니 "
+                     "현장 확인이 필요합니다.")
+
+# ── 횡단보도 목록 ──
+cross_all = [l for l in lines if is_crosswalk(l)]
+if cross_all:
+    with st.expander(f"🟢 경로상 횡단보도 {len(cross_all)}곳"):
+        for l in cross_all:
+            st.write(f"・횡단보도 {l['distance']}m — {l['desc'] or l['name'] or ''}")
 
 # ── 좁은 길 구간 목록 ──
 narrow_all = [l for l in lines if is_narrow(l)]
