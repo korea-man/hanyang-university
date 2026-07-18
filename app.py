@@ -205,6 +205,25 @@ def evaluate(pts, lines, total, zones, avoid_stairs, avoid_narrow, avoid_zone):
     return score, v, hits
 
 
+# ── 우회 경유지를 경유지 목록의 올바른 위치에 삽입 ──────
+def insert_detour(waypoints, detour, start, end):
+    """start→wp1→...→wpN→end 앵커 시퀀스 중 detour와 가장 가까운
+    구간(연속 앵커 쌍)의 사이에 삽입. passList 5곳 제한 준수."""
+    if len(waypoints) >= 5:
+        return None                      # 자리가 없으면 삽입 불가
+    anchors = [start] + list(waypoints) + [end]
+    best_i, best_d = 0, float("inf")
+    for i in range(len(anchors) - 1):
+        mid = ((anchors[i][0] + anchors[i + 1][0]) / 2,
+               (anchors[i][1] + anchors[i + 1][1]) / 2)
+        d = haversine_m(detour, mid)
+        if d < best_d:
+            best_i, best_d = i, d
+    out = list(waypoints)
+    out.insert(best_i, detour)           # anchors[i]와 [i+1] 사이 = waypoints의 i 위치
+    return out
+
+
 # ── 공사 구역 회피용 경유지 생성 ────────────────────────
 def make_detour(hits, zones):
     """위반 좌표를 구역 밖으로 밀어낸 경유지 1개 생성"""
@@ -229,14 +248,17 @@ def make_detour(hits, zones):
 # 3. 탐색 오케스트레이션
 # ══════════════════════════════════════════════════════════
 def find_best_route(app_key, start, end, zones,
-                    avoid_stairs, avoid_narrow, avoid_zone):
+                    avoid_stairs, avoid_narrow, avoid_zone,
+                    waypoints=None):
+    waypoints = waypoints or []
     # 회피 조건에 맞는 searchOption 우선순위 구성
     opts = [30, 4, 0, 10] if avoid_stairs else ([4, 0, 30, 10] if avoid_narrow else [0, 4, 10, 30])
 
     candidates, errors = [], []
     for so in opts:
         try:
-            gj = call_pedestrian_api(app_key, start, end, so)
+            gj = call_pedestrian_api(app_key, start, end, so,
+                                     pass_list=waypoints or None)
         except Exception as e:
             errors.append(f"searchOption={so}: {e}")
             continue
@@ -254,10 +276,11 @@ def find_best_route(app_key, start, end, zones,
     # 공사 구역을 여전히 통과하면 회피 경유지 삽입 후 1회 재탐색
     if avoid_zone and best["hits"]:
         wp = make_detour(best["hits"], zones)
-        if wp:
+        merged = insert_detour(waypoints, wp, start, end) if wp else None
+        if merged:
             try:
                 gj = call_pedestrian_api(app_key, start, end, best["opt"],
-                                         pass_list=[wp])
+                                         pass_list=merged)
                 pts, lines, total = parse_route(gj)
                 sc, v, hits = evaluate(pts, lines, total, zones,
                                        avoid_stairs, avoid_narrow, avoid_zone)
@@ -277,6 +300,7 @@ def find_best_route(app_key, start, end, zones,
 ss = st.session_state
 ss.setdefault("start", None)
 ss.setdefault("end", None)
+ss.setdefault("waypoints", [])     # [(lon, lat), ...] 최대 5곳
 ss.setdefault("mode", "출발지")
 ss.setdefault("zones", [])
 ss.setdefault("result", None)
@@ -300,7 +324,7 @@ with st.sidebar:
 
     st.header("② 지점 선택")
     ss["mode"] = st.radio("지도 클릭 시 지정할 지점",
-                          ["출발지", "도착지"], horizontal=True)
+                          ["출발지", "경유지", "도착지"], horizontal=True)
 
     try:
         from streamlit_geolocation import streamlit_geolocation
@@ -319,12 +343,39 @@ with st.sidebar:
     if c2.button("도착지 초기화"):
         ss["end"] = None
 
+    # ── 경유지 목록 (최대 5곳, TMAP passList 제한) ──
+    if ss["waypoints"]:
+        st.markdown(f"**경유지 ({len(ss['waypoints'])}/5)** — 방문 순서대로")
+        for i, (lo, la) in enumerate(ss["waypoints"]):
+            w1, w2, w3, w4 = st.columns([4, 1, 1, 1])
+            w1.caption(f"{i+1}. ({la:.5f}, {lo:.5f})")
+            if w2.button("▲", key=f"wp_up_{i}", disabled=(i == 0),
+                         help="순서 앞으로"):
+                ss["waypoints"][i-1], ss["waypoints"][i] = \
+                    ss["waypoints"][i], ss["waypoints"][i-1]
+                st.rerun()
+            if w3.button("▼", key=f"wp_dn_{i}",
+                         disabled=(i == len(ss["waypoints"]) - 1),
+                         help="순서 뒤로"):
+                ss["waypoints"][i+1], ss["waypoints"][i] = \
+                    ss["waypoints"][i], ss["waypoints"][i+1]
+                st.rerun()
+            if w4.button("✕", key=f"wp_del_{i}", help="삭제"):
+                ss["waypoints"].pop(i)
+                st.rerun()
+        if st.button("경유지 모두 삭제"):
+            ss["waypoints"] = []
+            st.rerun()
+
     st.header("③ 회피 조건")
     avoid_stairs = st.checkbox("계단 제외", True)
     avoid_narrow = st.checkbox("좁은 길 제외 (대로 우선)", True)
     avoid_zone = st.checkbox("공사 구역 제외", True)
     st.caption("공사 구역은 지도의 그리기 도구(원/다각형)로 직접 지정하세요. "
                "TMAP API는 공사 정보를 제공하지 않습니다.")
+    if avoid_zone and len(ss["waypoints"]) >= 5:
+        st.warning("경유지가 이미 5곳이라 공사 구역 자동 우회 경유지를 "
+                   "추가할 수 없습니다. 경유지를 줄이면 우회 재탐색이 가능합니다.")
 
     if ss["zones"]:
         st.write(f"등록된 회피 구역: {len(ss['zones'])}개")
@@ -347,6 +398,15 @@ if ss["start"]:
 if ss["end"]:
     folium.Marker([ss["end"][1], ss["end"][0]], tooltip="도착",
                   icon=folium.Icon(color="red", icon="stop")).add_to(m)
+for i, (lo, la) in enumerate(ss["waypoints"]):
+    folium.Marker(
+        [la, lo], tooltip=f"경유지 {i+1}",
+        icon=folium.DivIcon(html=(
+            f'<div style="background:#f39c12;color:#fff;border:2px solid #fff;'
+            f'border-radius:50%;width:26px;height:26px;line-height:22px;'
+            f'text-align:center;font-weight:bold;font-size:13px;'
+            f'box-shadow:0 1px 4px rgba(0,0,0,.4)">{i+1}</div>'))
+    ).add_to(m)
 
 for z in ss["zones"]:
     if z["kind"] == "circle":
@@ -377,14 +437,23 @@ if res:
 map_state = st_folium(m, width=None, height=560,
                       returned_objects=["last_clicked", "all_drawings"])
 
-# 클릭 → 출발/도착 지정
+# 클릭 → 출발/경유/도착 지정
 if map_state and map_state.get("last_clicked"):
     lc = map_state["last_clicked"]
     pt = (lc["lng"], lc["lat"])
-    key = "start" if ss["mode"] == "출발지" else "end"
-    if ss[key] != pt:
-        ss[key] = pt
-        st.rerun()
+    if ss["mode"] == "경유지":
+        if pt not in ss["waypoints"]:
+            if len(ss["waypoints"]) >= 5:
+                st.toast("경유지는 최대 5곳입니다 (TMAP API 제한). "
+                         "기존 경유지를 삭제 후 추가하세요.", icon="⚠️")
+            else:
+                ss["waypoints"].append(pt)
+                st.rerun()
+    else:
+        key = "start" if ss["mode"] == "출발지" else "end"
+        if ss[key] != pt:
+            ss[key] = pt
+            st.rerun()
 
 # 그리기 → 회피 구역 등록
 if map_state and map_state.get("all_drawings"):
@@ -409,7 +478,8 @@ if st.button("🔍 경로 탐색", type="primary", disabled=not ready, use_conta
         try:
             best, cands, errs = find_best_route(
                 app_key, ss["start"], ss["end"], ss["zones"],
-                avoid_stairs, avoid_narrow, avoid_zone)
+                avoid_stairs, avoid_narrow, avoid_zone,
+                waypoints=ss["waypoints"])
             ss["result"] = best
             ss["cands"] = cands
             ss["errs"] = errs
