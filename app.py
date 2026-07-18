@@ -37,7 +37,7 @@ if IMG_PATH.exists():
     with h1:
         st.image(str(IMG_PATH), width=90)
     with h2:
-        st.title("보행자 경로안내 — 계단·공사·좁은길 회피")
+        st.title("⛰️산 안 넘고 \n 🌉강 안 건너 온 지도")
     st.logo(str(IMG_PATH))          # 사이드바 상단 로고
 else:
     st.title("🚶 보행자 경로안내 — 계단·공사·좁은길 회피")
