@@ -284,6 +284,17 @@ ss.setdefault("cands", [])
 ss.setdefault("detour", None)
 ss.setdefault("opts_used", (False, False, False))
 
+# ── 공사 데이터 선로딩: 앱이 뜨는 즉시 백그라운드 캐시로 확보 ──
+if "constr_items" not in ss:
+    with st.spinner("🚧 생활안전지도 건설공사 데이터를 미리 로딩 중... "
+                    "(최초 1회, 이후 24시간 캐시)"):
+        try:
+            ss["constr_items"] = fetch_construction()
+            ss["constr_err"] = None
+        except Exception as e:
+            ss["constr_items"] = []
+            ss["constr_err"] = str(e)
+
 with st.sidebar:
     st.header("📍 지점 입력")
     st.caption("주소, 지명, 건물명 무엇이든 입력하세요 (예: 홍대입구역, 연세대학교)")
@@ -313,6 +324,19 @@ with st.sidebar:
     a_nr = st.checkbox("↔️ 좁은 길 피하기 (대로 우선)", value=False)
     a_zn = st.checkbox("🚧 공사 구역 피하기 (생활안전지도)", value=False)
     radius = st.slider("공사장 회피 반경(m)", 30, 300, 100)
+    if ss.get("constr_err"):
+        st.error(f"공사 데이터 로드 실패: {ss['constr_err']}")
+        if st.button("공사 데이터 다시 시도"):
+            fetch_construction.clear()
+            del ss["constr_items"]
+            st.rerun()
+    else:
+        st.caption(f"✅ 공사 데이터 준비됨: 전국 "
+                   f"{len(ss.get('constr_items', [])):,}건 (24h 캐시)")
+        if st.button("공사 데이터 새로고침"):
+            fetch_construction.clear()
+            del ss["constr_items"]
+            st.rerun()
 
     st.header("🎨 표시")
     spacing = st.slider("점선 간격(m)", 5, 30, 12)
@@ -367,15 +391,15 @@ if go:
         for e in errors:
             st.error(e)
     else:
-        # 4) 공사 구역 (앵커 주변 1km)
+        # 4) 공사 구역 (선로딩된 데이터에서 앵커 주변 1km만 필터, 즉시 완료)
         zones = []
         if a_zn:
-            with st.spinner("생활안전지도 건설공사 데이터 로딩 중..."):
-                try:
-                    items = fetch_construction()
-                    zones = zones_near(items, [start] + waypts + [end], radius)
-                except Exception as e:
-                    st.warning(f"공사 데이터 로딩 실패(공사 회피 없이 진행): {e}")
+            if ss.get("constr_err"):
+                st.warning("공사 데이터가 로드되지 않아 공사 회피 없이 진행합니다. "
+                           "사이드바에서 '다시 시도'를 눌러주세요.")
+            else:
+                zones = zones_near(ss["constr_items"],
+                                   [start] + waypts + [end], radius)
 
         # 5) 경로 탐색
         with st.spinner("경로 탐색 중..."):
